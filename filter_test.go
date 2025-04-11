@@ -6,6 +6,14 @@ import (
 	"testing"
 )
 
+// addrHelper creates a slice of pveInventoryAddr from netip.Addr values
+func addrHelper(addrs ...netip.Addr) []pveInventoryAddr {
+	if len(addrs) == 0 {
+		return []pveInventoryAddr{}
+	}
+	return []pveInventoryAddr{{Addrs: addrs}}
+}
+
 func TestFilterConfig_FilterResources(t *testing.T) {
 	// Create test inventory
 	inventory := []pveInventoryItem{
@@ -13,32 +21,32 @@ func TestFilterConfig_FilterResources(t *testing.T) {
 			Name: "vm1",
 			Type: pveItemTypeQEMU,
 			Tags: stringBoolMap("prod", "web"),
-			Addrs: []netip.Addr{
+			Addrs: addrHelper(
 				netip.MustParseAddr("192.168.1.10"),
 				netip.MustParseAddr("2001:db8::1"),
-			},
+			),
 		},
 		{
 			Name: "vm2",
 			Type: pveItemTypeLXC,
 			Tags: stringBoolMap("prod", "db"),
-			Addrs: []netip.Addr{
+			Addrs: addrHelper(
 				netip.MustParseAddr("192.168.1.20"),
-			},
+			),
 		},
 		{
 			Name: "vm3",
 			Type: pveItemTypeQEMU,
 			Tags: stringBoolMap("dev", "web"),
-			Addrs: []netip.Addr{
+			Addrs: addrHelper(
 				netip.MustParseAddr("10.0.0.5"),
-			},
+			),
 		},
 		{
 			Name:  "vm4",
 			Type:  pveItemTypeQEMU,
 			Tags:  stringBoolMap("test"),
-			Addrs: []netip.Addr{}, // No IP addresses
+			Addrs: addrHelper(), // No IP addresses
 		},
 	}
 
@@ -402,7 +410,7 @@ func TestFilterConfig_ShouldIncludeResourceByCIDRs(t *testing.T) {
 			name:   "no include filters - should include",
 			config: FilterConfig{},
 			item: pveInventoryItem{
-				Addrs: []netip.Addr{netip.MustParseAddr("192.168.1.10")},
+				Addrs: addrHelper(netip.MustParseAddr("192.168.1.10")),
 			},
 			want: true,
 		},
@@ -412,7 +420,7 @@ func TestFilterConfig_ShouldIncludeResourceByCIDRs(t *testing.T) {
 				IncludeCIDRs: []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")},
 			},
 			item: pveInventoryItem{
-				Addrs: []netip.Addr{netip.MustParseAddr("192.168.1.10")},
+				Addrs: addrHelper(netip.MustParseAddr("192.168.1.10")),
 			},
 			want: true,
 		},
@@ -425,7 +433,7 @@ func TestFilterConfig_ShouldIncludeResourceByCIDRs(t *testing.T) {
 				},
 			},
 			item: pveInventoryItem{
-				Addrs: []netip.Addr{netip.MustParseAddr("192.168.1.10")},
+				Addrs: addrHelper(netip.MustParseAddr("192.168.1.10")),
 			},
 			want: true,
 		},
@@ -435,10 +443,10 @@ func TestFilterConfig_ShouldIncludeResourceByCIDRs(t *testing.T) {
 				IncludeCIDRs: []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")},
 			},
 			item: pveInventoryItem{
-				Addrs: []netip.Addr{
+				Addrs: addrHelper(
 					netip.MustParseAddr("10.0.0.5"),
 					netip.MustParseAddr("192.168.1.10"),
-				},
+				),
 			},
 			want: true,
 		},
@@ -448,7 +456,7 @@ func TestFilterConfig_ShouldIncludeResourceByCIDRs(t *testing.T) {
 				IncludeCIDRs: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")},
 			},
 			item: pveInventoryItem{
-				Addrs: []netip.Addr{netip.MustParseAddr("192.168.1.10")},
+				Addrs: addrHelper(netip.MustParseAddr("192.168.1.10")),
 			},
 			want: false,
 		},
@@ -458,7 +466,7 @@ func TestFilterConfig_ShouldIncludeResourceByCIDRs(t *testing.T) {
 				IncludeCIDRs: []netip.Prefix{netip.MustParsePrefix("2001:db8::/32")},
 			},
 			item: pveInventoryItem{
-				Addrs: []netip.Addr{netip.MustParseAddr("2001:db8::1")},
+				Addrs: addrHelper(netip.MustParseAddr("2001:db8::1")),
 			},
 			want: true,
 		},
@@ -468,7 +476,7 @@ func TestFilterConfig_ShouldIncludeResourceByCIDRs(t *testing.T) {
 				IncludeCIDRs: []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")},
 			},
 			item: pveInventoryItem{
-				Addrs: []netip.Addr{},
+				Addrs: addrHelper(),
 			},
 			want: false,
 		},
@@ -499,7 +507,7 @@ func TestFilterConfig_ShouldExcludeResourceByCIDRs(t *testing.T) {
 			name:   "no exclude filters - should not exclude",
 			config: FilterConfig{},
 			item: pveInventoryItem{
-				Addrs: []netip.Addr{netip.MustParseAddr("192.168.1.10")},
+				Addrs: addrHelper(netip.MustParseAddr("192.168.1.10")),
 			},
 			want: false,
 		},
@@ -509,7 +517,7 @@ func TestFilterConfig_ShouldExcludeResourceByCIDRs(t *testing.T) {
 				ExcludeCIDRs: []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")},
 			},
 			item: pveInventoryItem{
-				Addrs: []netip.Addr{netip.MustParseAddr("192.168.1.10")},
+				Addrs: addrHelper(netip.MustParseAddr("192.168.1.10")),
 			},
 			want: true,
 		},
@@ -522,7 +530,7 @@ func TestFilterConfig_ShouldExcludeResourceByCIDRs(t *testing.T) {
 				},
 			},
 			item: pveInventoryItem{
-				Addrs: []netip.Addr{netip.MustParseAddr("192.168.1.10")},
+				Addrs: addrHelper(netip.MustParseAddr("192.168.1.10")),
 			},
 			want: true,
 		},
@@ -532,10 +540,10 @@ func TestFilterConfig_ShouldExcludeResourceByCIDRs(t *testing.T) {
 				ExcludeCIDRs: []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")},
 			},
 			item: pveInventoryItem{
-				Addrs: []netip.Addr{
+				Addrs: addrHelper(
 					netip.MustParseAddr("10.0.0.5"),
 					netip.MustParseAddr("192.168.1.10"),
-				},
+				),
 			},
 			want: true,
 		},
@@ -545,7 +553,7 @@ func TestFilterConfig_ShouldExcludeResourceByCIDRs(t *testing.T) {
 				ExcludeCIDRs: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")},
 			},
 			item: pveInventoryItem{
-				Addrs: []netip.Addr{netip.MustParseAddr("192.168.1.10")},
+				Addrs: addrHelper(netip.MustParseAddr("192.168.1.10")),
 			},
 			want: false,
 		},
@@ -555,7 +563,7 @@ func TestFilterConfig_ShouldExcludeResourceByCIDRs(t *testing.T) {
 				ExcludeCIDRs: []netip.Prefix{netip.MustParsePrefix("2001:db8::/32")},
 			},
 			item: pveInventoryItem{
-				Addrs: []netip.Addr{netip.MustParseAddr("2001:db8::1")},
+				Addrs: addrHelper(netip.MustParseAddr("2001:db8::1")),
 			},
 			want: true,
 		},
@@ -565,7 +573,7 @@ func TestFilterConfig_ShouldExcludeResourceByCIDRs(t *testing.T) {
 				ExcludeCIDRs: []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")},
 			},
 			item: pveInventoryItem{
-				Addrs: []netip.Addr{},
+				Addrs: addrHelper(),
 			},
 			want: false,
 		},

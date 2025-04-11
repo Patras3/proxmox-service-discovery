@@ -1,11 +1,13 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -95,6 +97,14 @@ type nodeInventoryStats struct {
 	NumLXCs int
 }
 
+// pveInventoryAddr represents information about one or more addresses in a Proxmox cluster.
+type pveInventoryAddr struct {
+	// Bridge is the name of the bridge the address is on.
+	Bridge string
+	// Addrs are the actual IP address(es).
+	Addrs []netip.Addr
+}
+
 type pveInventoryItem struct {
 	// Name is the name of the resource.
 	Name string
@@ -107,7 +117,7 @@ type pveInventoryItem struct {
 	// Tags are the tags associated with the resource.
 	Tags map[string]bool
 	// Addrs are the IP addresses associated with the resource.
-	Addrs []netip.Addr
+	Addrs []pveInventoryAddr
 }
 
 type pveItemType int
@@ -417,7 +427,7 @@ func stringBoolMap(from ...string) map[string]bool {
 	return m
 }
 
-func (s *server) fetchQEMUAddrs(ctx context.Context, node string, vmID int) ([]netip.Addr, error) {
+func (s *server) fetchQEMUAddrs(ctx context.Context, node string, vmID int) ([]pveInventoryAddr, error) {
 	logger := logger.With("vm", vmID, "node", node)
 
 	// Start by seeing if we can find a static IP address in the QEMU config.
@@ -472,7 +482,7 @@ func (s *server) fetchQEMUAddrs(ctx context.Context, node string, vmID int) ([]n
 	}
 	logger.Debug("fetched QEMU guest interfaces", "num_interfaces", len(interfaces.Result))
 
-	var addrs []netip.Addr
+	var addrs []pveInventoryAddr
 	for _, iface := range interfaces.Result {
 		if iface.Name == "lo" {
 			continue
@@ -498,13 +508,15 @@ func (s *server) fetchQEMUAddrs(ctx context.Context, node string, vmID int) ([]n
 				logger.Error("parsing IP address", "address", addr.Address, pvelog.Error(err))
 				continue
 			}
-			addrs = append(addrs, ip)
+			addrs = append(addrs, pveInventoryAddr{
+				Addrs: []netip.Addr{ip},
+			})
 		}
 	}
 	return addrs, nil
 }
 
-func (s *server) fetchLXCAddrs(ctx context.Context, node string, vmID int) ([]netip.Addr, error) {
+func (s *server) fetchLXCAddrs(ctx context.Context, node string, vmID int) ([]pveInventoryAddr, error) {
 	logger := logger.With("lxc", vmID, "node", node)
 
 	// Fetch the LXC guest config (to see if we can find a static IP address).
@@ -524,7 +536,7 @@ func (s *server) fetchLXCAddrs(ctx context.Context, node string, vmID int) ([]ne
 	return extractLXCAddrs(ctx, logger, conf, interfaces)
 }
 
-func extractLXCAddrs(ctx context.Context, logger *slog.Logger, conf pveapi.LXCConfig, interfaces []pveapi.LXCInterface) ([]netip.Addr, error) {
+func extractLXCAddrs(ctx context.Context, logger *slog.Logger, conf pveapi.LXCConfig, interfaces []pveapi.LXCInterface) ([]pveInventoryAddr, error) {
 	// The source of truth for what addresses a LXC can be reached by is
 	// the 'interfaces' array, since that data comes from inside the LXC
 	// itself. However, we can use the configuration to filter out
@@ -541,7 +553,15 @@ func extractLXCAddrs(ctx context.Context, logger *slog.Logger, conf pveapi.LXCCo
 		configParsed[ifname] = splitKVs(confstr)
 	}
 
-	addrs := make(map[netip.Addr]bool)
+	addrs := make(map[string]map[netip.Addr]bool) // map["vmbr0"]map[netip.Addr]bool
+	addAddr := func(bridge string, addr netip.Addr) {
+		perBridge := addrs[bridge]
+		if perBridge == nil {
+			perBridge = make(map[netip.Addr]bool)
+			addrs[bridge] = perBridge
+		}
+		perBridge[addr] = true
+	}
 
 	// Next: we want to drop any interface that doesn't have a hardware
 	// address, since we can't match it to anything in the LXC
@@ -558,12 +578,20 @@ func extractLXCAddrs(ctx context.Context, logger *slog.Logger, conf pveapi.LXCCo
 	// statically-configured IPv6 address.
 	configByHwaddr := make(map[string]map[string]string)
 	for _, kvs := range configParsed {
+		// We always expect a bridge name in the LXC configuration.
+		// If we don't have one, skip this interface.
+		bridge, ok := kvs["bridge"]
+		if !ok {
+			logger.Warn("skipping interface because it has no bridge", slog.Any("config", kvs))
+			continue
+		}
+
 		// Start by adding any valid IPv6 addresses from the LXC
 		// configuration to our list of addresses.
 		if ipv6, ok := kvs["ip6"]; ok {
 			pfx, err := netip.ParsePrefix(ipv6)
 			if err == nil {
-				addrs[pfx.Addr()] = true
+				addAddr(bridge, pfx.Addr())
 			} else {
 				logger.Error("parsing static IPv6 address",
 					slog.String("address", ipv6),
@@ -595,7 +623,8 @@ func extractLXCAddrs(ctx context.Context, logger *slog.Logger, conf pveapi.LXCCo
 		// If we found any specified hardware addresses in our LXC
 		// configuration, only include addresses for those interfaces.
 		lowerHwAddr := strings.ToLower(iface.HardwareAddress)
-		if len(configByHwaddr) > 0 && configByHwaddr[lowerHwAddr] == nil {
+		thisConfig := configByHwaddr[lowerHwAddr]
+		if len(configByHwaddr) > 0 && thisConfig == nil {
 			logger.Debug("skipping interface because the hardware address is unrecognized",
 				slog.String("interface_name", iface.Name),
 				slog.String("hardware_address", iface.HardwareAddress),
@@ -603,13 +632,16 @@ func extractLXCAddrs(ctx context.Context, logger *slog.Logger, conf pveapi.LXCCo
 			continue
 		}
 
+		// If we have a configuration for this interface, get the bridge name.
+		bridge := thisConfig["bridge"]
+
 		// Great, now see if we can parse the IP address(es).
 		if iface.Inet != "" {
 			pref, err := netip.ParsePrefix(iface.Inet)
 			if err != nil {
 				logger.Error("parsing IP prefix", slog.String("prefix", iface.Inet), pvelog.Error(err))
 			} else {
-				addrs[pref.Addr()] = true
+				addAddr(bridge, pref.Addr())
 			}
 		}
 		if iface.Inet6 != "" {
@@ -617,17 +649,27 @@ func extractLXCAddrs(ctx context.Context, logger *slog.Logger, conf pveapi.LXCCo
 			if err != nil {
 				logger.Error("parsing IPv6 prefix", slog.String("prefix", iface.Inet6), pvelog.Error(err))
 			} else {
-				addrs[pref.Addr()] = true
+				addAddr(bridge, pref.Addr())
 			}
 		}
 	}
 
 	// Great, all done! Return the list of addresses.
-	addrsList := make([]netip.Addr, 0, len(addrs))
-	for addr := range addrs {
-		addrsList = append(addrsList, addr)
+	addrsList := make([]pveInventoryAddr, 0, len(addrs))
+	for bridge, addrMap := range addrs {
+		baddrs := slices.Collect(maps.Keys(addrMap))
+
+		// Sort addresses before storing.
+		slices.SortFunc(baddrs, netip.Addr.Compare)
+		addrsList = append(addrsList, pveInventoryAddr{
+			Bridge: bridge,
+			Addrs:  baddrs,
+		})
 	}
-	slices.SortFunc(addrsList, netip.Addr.Compare)
+	slices.SortFunc(addrsList, func(a, b pveInventoryAddr) int {
+		return cmp.Compare(a.Bridge, b.Bridge)
+
+	})
 	return addrsList, nil
 }
 

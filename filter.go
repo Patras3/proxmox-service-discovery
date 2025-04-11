@@ -242,9 +242,11 @@ func (f *Filter) shouldIncludeResourceByCIDRs(item pveInventoryItem) bool {
 
 	// If there are include CIDRs, include only if the item has at least one
 	// IP address within any of the CIDRs.
-	for _, ip := range item.Addrs {
-		if f.includeCIDRs.Contains(ip) {
-			return true
+	for _, addrSet := range item.Addrs {
+		for _, ip := range addrSet.Addrs {
+			if f.includeCIDRs.Contains(ip) {
+				return true
+			}
 		}
 	}
 
@@ -265,9 +267,11 @@ func (f *Filter) shouldExcludeResourceByCIDRs(item pveInventoryItem) bool {
 
 	// If there are exclude CIDRs, exclude if the item has any IP address
 	// within any of the CIDRs.
-	for _, ip := range item.Addrs {
-		if f.excludeCIDRs.Contains(ip) {
-			return true
+	for _, addrSet := range item.Addrs {
+		for _, ip := range addrSet.Addrs {
+			if f.excludeCIDRs.Contains(ip) {
+				return true
+			}
 		}
 	}
 	return false

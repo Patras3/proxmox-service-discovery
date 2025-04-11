@@ -352,27 +352,29 @@ func (s *server) updateDNSRecords(ctx context.Context) error {
 		}
 
 		var answers []dns.RR
-		for _, addr := range item.Addrs {
-			if addr.Is4() {
-				rr := new(dns.A)
-				rr.Hdr = dns.RR_Header{
-					Name:   fqdn,
-					Rrtype: dns.TypeA,
-					Class:  dns.ClassINET,
-					Ttl:    60,
+		for _, addrSet := range item.Addrs {
+			for _, addr := range addrSet.Addrs {
+				if addr.Is4() {
+					rr := new(dns.A)
+					rr.Hdr = dns.RR_Header{
+						Name:   fqdn,
+						Rrtype: dns.TypeA,
+						Class:  dns.ClassINET,
+						Ttl:    60,
+					}
+					rr.A = addr.AsSlice()
+					answers = append(answers, rr)
+				} else if addr.Is6() {
+					rr := new(dns.AAAA)
+					rr.Hdr = dns.RR_Header{
+						Name:   fqdn,
+						Rrtype: dns.TypeAAAA,
+						Class:  dns.ClassINET,
+						Ttl:    60,
+					}
+					rr.AAAA = addr.AsSlice()
+					answers = append(answers, rr)
 				}
-				rr.A = addr.AsSlice()
-				answers = append(answers, rr)
-			} else if addr.Is6() {
-				rr := new(dns.AAAA)
-				rr.Hdr = dns.RR_Header{
-					Name:   fqdn,
-					Rrtype: dns.TypeAAAA,
-					Class:  dns.ClassINET,
-					Ttl:    60,
-				}
-				rr.AAAA = addr.AsSlice()
-				answers = append(answers, rr)
 			}
 		}
 

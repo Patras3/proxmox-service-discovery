@@ -218,8 +218,7 @@ func TestFetchQEMUAddrs(t *testing.T) {
 				t.Fatalf("fetchQEMUAddrs returned error: %v", err)
 			}
 
-			// Sort both.
-			slices.SortFunc(ips, netip.Addr.Compare)
+			// Sort expected; response from fetchQEMUAddrs should already be sorted.
 			slices.SortFunc(tt.expectedIPs, netip.Addr.Compare)
 
 			// Check the result
@@ -320,8 +319,7 @@ func TestFetchLXCAddrs(t *testing.T) {
 				t.Fatalf("fetchLXCAddrs returned error: %v", err)
 			}
 
-			// Sort both
-			slices.SortFunc(ips, netip.Addr.Compare)
+			// Sort expected; response from fetchLXCAddrs should already be sorted.
 			slices.SortFunc(tt.expectedIPs, netip.Addr.Compare)
 
 			// Check the result
@@ -429,7 +427,7 @@ func TestFetchInventory(t *testing.T) {
 			Node:  "node1",
 			Type:  pveItemTypeQEMU,
 			Tags:  stringBoolMap("web", "prod"),
-			Addrs: []netip.Addr{netip.MustParseAddr("192.168.1.100")},
+			Addrs: addrHelper(netip.MustParseAddr("192.168.1.100")),
 		},
 		{
 			Name:  "vm3",
@@ -437,7 +435,7 @@ func TestFetchInventory(t *testing.T) {
 			Node:  "node2",
 			Type:  pveItemTypeQEMU,
 			Tags:  stringBoolMap("app", "prod"),
-			Addrs: []netip.Addr{netip.MustParseAddr("192.168.1.102")},
+			Addrs: addrHelper(netip.MustParseAddr("192.168.1.102")),
 		},
 		{
 			Name:  "lxc1",
@@ -445,7 +443,7 @@ func TestFetchInventory(t *testing.T) {
 			Node:  "node1",
 			Type:  pveItemTypeLXC,
 			Tags:  stringBoolMap("cache", "prod"),
-			Addrs: []netip.Addr{netip.MustParseAddr("192.168.1.200")},
+			Addrs: addrHelper(netip.MustParseAddr("192.168.1.200")),
 		},
 		{
 			Name:  "lxc2",
@@ -453,7 +451,7 @@ func TestFetchInventory(t *testing.T) {
 			Node:  "node2",
 			Type:  pveItemTypeLXC,
 			Tags:  stringBoolMap("web", "stage"),
-			Addrs: []netip.Addr{netip.MustParseAddr("192.168.1.201")},
+			Addrs: addrHelper(netip.MustParseAddr("192.168.1.201")),
 		},
 	}
 
