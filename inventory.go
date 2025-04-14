@@ -418,14 +418,6 @@ func (s *server) fetchInventoryFromNode(ctx context.Context, node string) (inven
 	return inventory, stats, nil
 }
 
-func stringBoolMap(from ...string) map[string]bool {
-	m := make(map[string]bool, len(from))
-	for _, s := range from {
-		m[s] = true
-	}
-	return m
-}
-
 func (s *server) fetchQEMUAddrs(ctx context.Context, node string, vmID int) ([]pveInventoryAddr, error) {
 	logger := logger.With("vm", vmID, "node", node)
 
@@ -656,6 +648,10 @@ func (s *server) fetchLXCAddrs(ctx context.Context, node string, vmID int) ([]pv
 	return extractLXCAddrs(ctx, logger, conf, interfaces)
 }
 
+// extractLXCAddrs will take the provided LXC configuration and interfaces
+// returned from the Proxmox API, and return a list of IP addresses for the
+// LXC, filtered to only interfaces that are configured in Proxmox (e.g.
+// ignoring in-LXC VPN interfaces, localhost, etc.)
 func extractLXCAddrs(
 	ctx context.Context,
 	logger *slog.Logger,
@@ -710,7 +706,7 @@ func extractLXCAddrs(
 
 		// Add any statically-configured IPs to our map.
 		for _, key := range []string{"ip", "ip6"} {
-			if s, ok := kvs[key]; ok {
+			if s, ok := kvs[key]; ok && s != "dhcp" {
 				pfx, err := netip.ParsePrefix(s)
 				if err != nil {
 					logger.Error("parsing static address",
@@ -803,7 +799,8 @@ func extractLXCAddrs(
 	// Great, now construct our return list.
 	ret := make([]pveInventoryAddr, 0, len(addrsFromLXC))
 	for _, addr := range addrsFromLXC {
-		// If we have any static addresses, add them as well.
+		// If we have any static addresses from the LXC configuration,
+		// add them as well.
 		currAddrs := addr.Addrs
 		if static, ok := staticAddrs[addr.Hwaddr]; ok {
 			currAddrs = append(currAddrs, static...)
