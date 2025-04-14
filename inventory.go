@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"maps"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -436,84 +435,205 @@ func (s *server) fetchQEMUAddrs(ctx context.Context, node string, vmID int) ([]p
 		return nil, fmt.Errorf("fetching QEMU config for %q on %q: %w", vmID, node, err)
 	}
 
-	// The ipconfig0 field is a comma-separated list of key-value pairs,
+	// Create a qemuInformation to hold the configuration and lazily calculate
+	// needed information.
+	qemuInfo := qemuInformation{
+		ID:     vmID,
+		Node:   node,
+		Config: conf,
+	}
+
+	// Get all interfaces from the QEMU agent.
+	interfaces, err := s.client.GetQEMUInterfaces(ctx, node, vmID)
+	if err != nil {
+		// If we can't get the interfaces, try to get the IP addresses from
+		// the cloud-init configuration.
+		if addrs := s.parseQEMUAddrsFromCloudInit(ctx, logger, &qemuInfo); len(addrs) > 0 {
+			logger.Warn("no interfaces from QEMU agent; fetched IP addresses from cloud-init",
+				slog.Any("addrs", addrs),
+				pvelog.Error(err),
+			)
+			return addrs, nil
+		} else {
+			logger.Debug("no IP addresses found in cloud-init")
+		}
+
+		return nil, fmt.Errorf("fetching QEMU guest interfaces for %q on %q: %w", vmID, node, err)
+	}
+	if len(interfaces.Result) == 0 {
+		// Fall back as above.
+		logger.Debug("no interfaces found in QEMU guest")
+		return s.parseQEMUAddrsFromCloudInit(ctx, logger, &qemuInfo), nil
+	}
+
+	logger.Debug("fetched QEMU guest interfaces", "num_interfaces", len(interfaces.Result))
+
+	var hostConfiguredInterfaces []pveapi.AgentInterface
+	if allHwaddrs := qemuInfo.getAllHwaddrs(); len(allHwaddrs) == 0 {
+		// Log all interface configuration for debugging.
+		var attrs []any
+		for ifnum, confstr := range conf.NetworkInterfaces {
+			attrs = append(attrs, slog.String(
+				fmt.Sprintf("iface_net%d", ifnum),
+				confstr,
+			))
+		}
+		logger.Warn("no hardware address found for QEMU guest, returning all IP addresses", attrs...)
+
+		// Use all interfaces if we have nothing to use as a filter.
+		hostConfiguredInterfaces = interfaces.Result
+	} else {
+		// Filter the interfaces to just ones that are specified in the
+		// QEMU configuration, by matching on the hardware address.
+		for _, iface := range interfaces.Result {
+			lowerHwAddr := strings.ToLower(iface.HardwareAddress)
+			if !allHwaddrs[lowerHwAddr] {
+				logger.Debug("skipping interface because the hardware address is unrecognized",
+					slog.String("interface_name", iface.Name),
+					slog.String("hardware_address", iface.HardwareAddress),
+				)
+				continue
+			}
+
+			// Lower-case the hardware address for consistency/so we can use it below.
+			hostConfiguredInterfaces = append(hostConfiguredInterfaces, pveapi.AgentInterface{
+				Name:            iface.Name,
+				HardwareAddress: lowerHwAddr,
+				IPAddresses:     iface.IPAddresses,
+			})
+		}
+	}
+
+	if len(hostConfiguredInterfaces) == 0 {
+		// TODO: more log attributes
+		logger.Warn("no interfaces in the guest matched the hardware addresses in the configuration")
+		return nil, nil
+	}
+
+	// Now, hostConfiguredInterfaces contains all interfaces, from inside
+	// the VM, that have a hardware address configured in Proxmox.
+	//
+	// Iterate through each of these interfaces and extract the IP
+	// addresses and corresponding bridge.
+	var addrs []pveInventoryAddr
+	for _, iface := range hostConfiguredInterfaces {
+		// Get the bridge name from the interface configuration.
+		bridge := qemuInfo.getBridgeByHwaddr(iface.HardwareAddress)
+		qaddrs := parseQEMUAddrs(logger, iface.IPAddresses)
+		if len(qaddrs) == 0 {
+			continue
+		}
+
+		addrs = append(addrs, pveInventoryAddr{
+			Bridge: bridge,
+			Addrs:  qaddrs,
+		})
+	}
+	return addrs, nil
+}
+
+// parseQEMUAddrsFromCloudInit will parse the QEMU configuration for
+// cloud-init information and return a list of statically-configured IP
+// addresses.
+//
+// This is used as a fallback if we cannot fetch information from the QEMU
+// agent in the guest.
+func (s *server) parseQEMUAddrsFromCloudInit(
+	ctx context.Context,
+	logger *slog.Logger,
+	qinfo *qemuInformation,
+) []pveInventoryAddr {
+	// The ipconfig[n] field is a comma-separated list of key-value pairs,
 	// used to pass configuration to cloud-init; see the following for more
 	// information:
 	//    https://pve.proxmox.com/pve-docs/chapter-qm.html#qm_cloudinit
 	//
-	// Split and see if there's an "ip" key.
-	ipConfig := splitKVs(conf.IPConfig0)
-	if ip, ok := ipConfig["ip"]; ok {
-		if pfx, err := netip.ParsePrefix(ip); err == nil {
-			return []netip.Addr{pfx.Addr()}, nil
-		} else {
-			logger.Warn("error parsing static IP address",
-				slog.String("address", ip),
-				pvelog.Error(err))
-		}
-	}
-
-	// Find the hardware address of all network interfaces specified in the
-	// QEMU configuration.
-	validHwaddrs := make(map[string]bool)
-	for _, confstr := range conf.NetworkInterfaces {
-		netConfig := splitKVs(confstr)
-
-		for _, key := range []string{"macaddr", "virtio"} {
-			if addr, ok := netConfig[key]; ok {
-				// Store addresses as lowercase
-				validHwaddrs[strings.ToLower(addr)] = true
-				break
-			}
-		}
-	}
-	if len(validHwaddrs) == 0 {
-		var attrs []any
-		for ifname, confstr := range conf.NetworkInterfaces {
-			attrs = append(attrs, slog.String("iface_"+ifname, confstr))
-		}
-		logger.Warn("no hardware address found for QEMU guest, returning all IP addresses", attrs...)
-	}
-
-	// Otherwise, fetch and return all non-localhost IP addresses from the QEMU guest, if any.
-	interfaces, err := s.client.GetQEMUInterfaces(ctx, node, vmID)
-	if err != nil {
-		return nil, fmt.Errorf("fetching QEMU guest interfaces for %q on %q: %w", vmID, node, err)
-	}
-	logger.Debug("fetched QEMU guest interfaces", "num_interfaces", len(interfaces.Result))
-
+	// Split and see if there's an "ip" or "ip6" key, and if so, add those
+	// to our addresses list.
 	var addrs []pveInventoryAddr
-	for _, iface := range interfaces.Result {
-		if iface.Name == "lo" {
+	for ifnum, confstr := range qinfo.Config.IPConfig {
+		ipConfig := qinfo.getIPConfig(ifnum)
+		if ipConfig == nil {
+			// We always expect a netN for a given ipconfigN.
+			logger.Warn("ipconfigN entry has no corresponding netN",
+				slog.Int("ifnum", ifnum),
+				slog.String("value", confstr))
 			continue
 		}
+		bridgeName := qinfo.getBridgeByIfnum(ifnum)
 
-		// If we found any specified hardware addresses in our QEMU
-		// configuration, only include addresses for those interfaces.
-		lowerHwAddr := strings.ToLower(iface.HardwareAddress)
-		if len(validHwaddrs) > 0 && !validHwaddrs[lowerHwAddr] {
-			logger.Debug("skipping interface because the hardware address is unrecognized",
-				slog.String("interface_name", iface.Name),
-				slog.String("hardware_address", iface.HardwareAddress),
-			)
-			continue
+		var ipAddrs []netip.Addr
+		for _, key := range []string{"ip", "ip6"} {
+			if ip, ok := ipConfig[key]; ok && ip != "dhcp" {
+				pfx, err := netip.ParsePrefix(ip)
+				if err != nil {
+					logger.Warn("error parsing static address",
+						slog.String("key", key),
+						slog.String("address", ip),
+						pvelog.Error(err))
+					continue
+				}
+				ipAddrs = append(ipAddrs, pfx.Addr())
+			}
 		}
 
-		for _, addr := range iface.IPAddresses {
-			if addr.Type != "ipv4" && addr.Type != "ipv6" {
-				continue
-			}
-			ip, err := netip.ParseAddr(addr.Address)
-			if err != nil {
-				logger.Error("parsing IP address", "address", addr.Address, pvelog.Error(err))
-				continue
-			}
+		logger.Info("parsed cloud-init configuration",
+			slog.Int("ifnum", ifnum),
+			slog.String("ipconfig", confstr),
+			slog.Any("kv", ipConfig),
+			slog.String("bridge", bridgeName),
+			slog.Any("addresses", ipAddrs),
+		)
+		if len(ipAddrs) > 0 {
 			addrs = append(addrs, pveInventoryAddr{
-				Addrs: []netip.Addr{ip},
+				Bridge: bridgeName,
+				Addrs:  ipAddrs,
 			})
 		}
 	}
-	return addrs, nil
+	return addrs
+}
+
+// hwaddrForQEMUInterface will parse a QEMU network interface configuration and
+// return the hardware address for that interface (i.e. the MAC address), or an
+// empty string if no recognized hardware address is set.
+func hwaddrForQEMUInterface(netConfig map[string]string) string {
+	for _, key := range []string{
+		"macaddr", // explicitly-configured MAC address
+		"virtio",  // virtio network interfaces
+		"e1000",   // E1000 network interface
+		// NOTE: we can add Realtek 8139 or vmxnet3 later
+		// TODO: what if we have both macaddr= and virtio=?
+	} {
+		if addr, ok := netConfig[key]; ok {
+			return strings.ToLower(addr)
+		}
+	}
+	return ""
+}
+
+// parseQEMUAddrs will parse the list of addresses from the QEMU agent
+// and return a []netip.Addr with the result.
+//
+// It will skip non-IPv4/IPv6 addresses, any address that does not parse, and
+// localhost addresses.
+func parseQEMUAddrs(logger *slog.Logger, addrs []pveapi.AgentInterfaceAddress) []netip.Addr {
+	var ret []netip.Addr
+	for _, addr := range addrs {
+		if addr.Type != "ipv4" && addr.Type != "ipv6" {
+			continue
+		}
+		ip, err := netip.ParseAddr(addr.Address)
+		if err != nil {
+			logger.Error("parsing IP address", "address", addr.Address, pvelog.Error(err))
+			continue
+		}
+		if ip.IsLoopback() {
+			continue
+		}
+		ret = append(ret, ip)
+	}
+	return ret
 }
 
 func (s *server) fetchLXCAddrs(ctx context.Context, node string, vmID int) ([]pveInventoryAddr, error) {
@@ -533,144 +653,178 @@ func (s *server) fetchLXCAddrs(ctx context.Context, node string, vmID int) ([]pv
 	}
 	logger.Debug("fetched LXC guest interfaces", "num_interfaces", len(interfaces))
 
-	return extractLXCAddrs(ctx, logger, conf, interfaces)
+	lxcConfig := lxcInformation{
+		ID:         vmID,
+		Node:       node,
+		Config:     conf,
+		Interfaces: interfaces,
+	}
+	return extractLXCAddrs(ctx, logger, &lxcConfig)
 }
 
-func extractLXCAddrs(ctx context.Context, logger *slog.Logger, conf pveapi.LXCConfig, interfaces []pveapi.LXCInterface) ([]pveInventoryAddr, error) {
-	// The source of truth for what addresses a LXC can be reached by is
-	// the 'interfaces' array, since that data comes from inside the LXC
-	// itself. However, we can use the configuration to filter out
-	// interfaces that aren't relevant to us (e.g. things created entirely
-	// inside the LXC).
-	//
-	// This isn't the most optimal algorithm, and we do multiple passes
-	// over the interfaces, but I'm hoping to make this as understandable
-	// as possible given the various edge cases here.
-	//
-	// Start by parsing all LXC network configurations.
-	configParsed := make(map[string]map[string]string)
-	for ifname, confstr := range conf.NetworkInterfaces {
-		configParsed[ifname] = splitKVs(confstr)
-	}
+func extractLXCAddrs(ctx context.Context, logger *slog.Logger, conf *lxcInformation) ([]pveInventoryAddr, error) {
+	// Parse the provided interface configuration, building up data
+	// structures that we use below.
+	var (
+		// hwaddrToBridge maps an interface's hardware address to the
+		// bridge that it's attached to. We use it to add the Bridge
+		// field to the returned pveInventoryAddr.
+		hwaddrToBridge = make(map[string]string) // map["aa:bb:cc:dd:ee:ff"]"vmbr0"
 
-	addrs := make(map[string]map[netip.Addr]bool) // map["vmbr0"]map[netip.Addr]bool
-	addAddr := func(bridge string, addr netip.Addr) {
-		perBridge := addrs[bridge]
-		if perBridge == nil {
-			perBridge = make(map[netip.Addr]bool)
-			addrs[bridge] = perBridge
-		}
-		perBridge[addr] = true
-	}
+		// staticAddrs contains any statically-configued addresses for
+		// a given interface.
+		//
+		// This is used because on versions of Proxmox before 8.4, only
+		// the first (possibly a random?) address is returned from the
+		// "get interfaces" API call. Thus, we want to add on any
+		// statically-configured addresses as well, just to be sure.
+		staticAddrs = make(map[string][]netip.Addr) // map["TKTK"]ips
+	)
+	for ifnum := range conf.Config.NetworkInterfaces {
+		kvs := conf.getNetworkKV(ifnum)
 
-	// Next: we want to drop any interface that doesn't have a hardware
-	// address, since we can't match it to anything in the LXC
-	// configuration. However, if there's a static IPv6 address in the LXC
-	// configuration, we keep that address.
-	//
-	// This is because the interfaces response only contains a single IPv6
-	// address (in LXCInterface.Inet6), which isn't always the same as the
-	// static IPv6 address in the LXC configuration, and we can have both
-	// addresses on the interface.
-	//
-	// At least anecdotally in my experience, Proxmox returns the IPv6
-	// link-local address from the /interfaces endpoint, not a
-	// statically-configured IPv6 address.
-	configByHwaddr := make(map[string]map[string]string)
-	for _, kvs := range configParsed {
-		// We always expect a bridge name in the LXC configuration.
+		// We always expect a bridge name and hardware address in the
+		// LXC configuration.
+		//
 		// If we don't have one, skip this interface.
 		bridge, ok := kvs["bridge"]
 		if !ok {
 			logger.Warn("skipping interface because it has no bridge", slog.Any("config", kvs))
 			continue
 		}
-
-		// Start by adding any valid IPv6 addresses from the LXC
-		// configuration to our list of addresses.
-		if ipv6, ok := kvs["ip6"]; ok {
-			pfx, err := netip.ParsePrefix(ipv6)
-			if err == nil {
-				addAddr(bridge, pfx.Addr())
-			} else {
-				logger.Error("parsing static IPv6 address",
-					slog.String("address", ipv6),
-					pvelog.Error(err))
-			}
-		}
-
-		// TODO: IPv4?
-
-		// Now, if there's no hardware address we skip this interface.
 		hwAddr := strings.ToLower(kvs["hwaddr"])
 		if hwAddr == "" {
+			logger.Warn("skipping interface with no hwaddr", slog.Any("config", kvs))
 			continue
 		}
 
-		// Finally, build up the information about this interface,
-		// keyed by hwaddr.
-		configByHwaddr[hwAddr] = kvs
+		if _, ok := hwaddrToBridge[hwAddr]; ok {
+			logger.Warn("duplicate hardware address found in LXC configuration",
+				slog.String("interface", fmt.Sprintf("net%d", ifnum)),
+				slog.String("hardware_address", hwAddr),
+			)
+			continue
+		}
+		hwaddrToBridge[hwAddr] = bridge
+
+		// Add any statically-configured IPs to our map.
+		for _, key := range []string{"ip", "ip6"} {
+			if s, ok := kvs[key]; ok {
+				pfx, err := netip.ParsePrefix(s)
+				if err != nil {
+					logger.Error("parsing static address",
+						slog.String("key", key),
+						slog.String("address", s),
+						pvelog.Error(err))
+					continue
+				}
+
+				staticAddrs[hwAddr] = append(staticAddrs[hwAddr], pfx.Addr())
+			}
+		}
 	}
 
-	// Finally, iterate over all interfaces and add their addresses to our
-	// list of addresses. If we have any hardware addresses in our LXC
-	// configuration, only include addresses for those interfaces.
-	for _, iface := range interfaces {
+	type addrInfo struct {
+		Bridge string
+		Hwaddr string
+		Addrs  []netip.Addr
+	}
+
+	// Now parse the interface information.
+	var addrsFromLXC []addrInfo
+	for _, iface := range conf.Interfaces {
 		if iface.Name == "lo" {
 			continue
 		}
 
-		// If we found any specified hardware addresses in our LXC
-		// configuration, only include addresses for those interfaces.
-		lowerHwAddr := strings.ToLower(iface.HardwareAddress)
-		thisConfig := configByHwaddr[lowerHwAddr]
-		if len(configByHwaddr) > 0 && thisConfig == nil {
-			logger.Debug("skipping interface because the hardware address is unrecognized",
-				slog.String("interface_name", iface.Name),
-				slog.String("hardware_address", iface.HardwareAddress),
-			)
-			continue
-		}
-
-		// If we have a configuration for this interface, get the bridge name.
-		bridge := thisConfig["bridge"]
-
-		// Great, now see if we can parse the IP address(es).
+		var addrs []netip.Addr
 		if iface.Inet != "" {
-			pref, err := netip.ParsePrefix(iface.Inet)
-			if err != nil {
-				logger.Error("parsing IP prefix", slog.String("prefix", iface.Inet), pvelog.Error(err))
+			pfx, err := netip.ParsePrefix(iface.Inet)
+			if err == nil {
+				addrs = append(addrs, pfx.Addr())
 			} else {
-				addAddr(bridge, pref.Addr())
+				logger.Error("parsing IP prefix", slog.String("prefix", iface.Inet), pvelog.Error(err))
 			}
 		}
 		if iface.Inet6 != "" {
-			pref, err := netip.ParsePrefix(iface.Inet6)
-			if err != nil {
-				logger.Error("parsing IPv6 prefix", slog.String("prefix", iface.Inet6), pvelog.Error(err))
+			pfx, err := netip.ParsePrefix(iface.Inet6)
+			if err == nil {
+				addrs = append(addrs, pfx.Addr())
 			} else {
-				addAddr(bridge, pref.Addr())
+				logger.Error("parsing IPv6 prefix", slog.String("prefix", iface.Inet6), pvelog.Error(err))
 			}
+		}
+
+		if len(addrs) > 0 {
+			addrsFromLXC = append(addrsFromLXC, addrInfo{
+				Hwaddr: strings.ToLower(iface.HardwareAddress),
+				Addrs:  addrs,
+
+				// Bridge is unknown here; we fill it in later.
+			})
 		}
 	}
 
-	// Great, all done! Return the list of addresses.
-	addrsList := make([]pveInventoryAddr, 0, len(addrs))
-	for bridge, addrMap := range addrs {
-		baddrs := slices.Collect(maps.Keys(addrMap))
+	// If we have no hardware addresses at all, there's a fast path here:
+	// just return all of the addresses from inside the LXC, since we can't
+	// filter the list to just the ones that we know are configured on the
+	// host. However, if we have at least one hardware address, filter our
+	// list to just interfaces with a recognized hardware address, and fill
+	// in the Bridge field.
+	if len(hwaddrToBridge) > 0 {
+		filtered := addrsFromLXC[:0]
+		for _, addr := range addrsFromLXC {
+			bridge, ok := hwaddrToBridge[addr.Hwaddr]
+			if !ok {
+				logger.Debug("skipping interface because the hardware address is unrecognized",
+					//slog.String("interface_name", iface.Name),
+					slog.String("hardware_address", addr.Hwaddr),
+				)
+				continue
+			}
 
-		// Sort addresses before storing.
-		slices.SortFunc(baddrs, netip.Addr.Compare)
-		addrsList = append(addrsList, pveInventoryAddr{
-			Bridge: bridge,
-			Addrs:  baddrs,
+			addr.Bridge = bridge
+			filtered = append(filtered, addr)
+		}
+		addrsFromLXC = filtered
+	} else {
+		// Log all interface configuration for debugging.
+		var attrs []any
+		for ifnum, confstr := range conf.Config.NetworkInterfaces {
+			attrs = append(attrs, slog.String(
+				fmt.Sprintf("iface_net%d", ifnum),
+				confstr,
+			))
+		}
+		logger.Warn("no hardware address found for LXC, returning all IP addresses", attrs...)
+	}
+
+	// Great, now construct our return list.
+	ret := make([]pveInventoryAddr, 0, len(addrsFromLXC))
+	for _, addr := range addrsFromLXC {
+		// If we have any static addresses, add them as well.
+		currAddrs := addr.Addrs
+		if static, ok := staticAddrs[addr.Hwaddr]; ok {
+			currAddrs = append(currAddrs, static...)
+		}
+
+		// Sort then deduplicate the addresses; this is a bit
+		// inefficient, but we typically only have a small number of
+		// addresses.
+		slices.SortFunc(currAddrs, netip.Addr.Compare)
+		currAddrs = slices.Compact(currAddrs)
+
+		ret = append(ret, pveInventoryAddr{
+			Bridge: addr.Bridge, // might be empty if we had no hwaddrs
+			Addrs:  currAddrs,
 		})
 	}
-	slices.SortFunc(addrsList, func(a, b pveInventoryAddr) int {
-		return cmp.Compare(a.Bridge, b.Bridge)
 
+	// Sort based on bridge so that we have a consistent return order.
+	slices.SortFunc(ret, func(a, b pveInventoryAddr) int {
+		return cmp.Compare(a.Bridge, b.Bridge)
 	})
-	return addrsList, nil
+	return ret, nil
 }
 
 func splitKVs(s string) map[string]string {

@@ -21,32 +21,31 @@ func TestFilterConfig_FilterResources(t *testing.T) {
 			Name: "vm1",
 			Type: pveItemTypeQEMU,
 			Tags: stringBoolMap("prod", "web"),
-			Addrs: addrHelper(
-				netip.MustParseAddr("192.168.1.10"),
-				netip.MustParseAddr("2001:db8::1"),
-			),
+			Addrs: []pveInventoryAddr{
+				mkPVEInventoryAddr("vmbr0", "192.168.1.10", "2001:db8::1"),
+			},
 		},
 		{
 			Name: "vm2",
 			Type: pveItemTypeLXC,
 			Tags: stringBoolMap("prod", "db"),
-			Addrs: addrHelper(
-				netip.MustParseAddr("192.168.1.20"),
-			),
+			Addrs: []pveInventoryAddr{
+				mkPVEInventoryAddr("vmbr0", "192.168.1.20"),
+			},
 		},
 		{
 			Name: "vm3",
 			Type: pveItemTypeQEMU,
 			Tags: stringBoolMap("dev", "web"),
-			Addrs: addrHelper(
-				netip.MustParseAddr("10.0.0.5"),
-			),
+			Addrs: []pveInventoryAddr{
+				mkPVEInventoryAddr("vmbr0", "10.0.0.5"),
+			},
 		},
 		{
 			Name:  "vm4",
 			Type:  pveItemTypeQEMU,
 			Tags:  stringBoolMap("test"),
-			Addrs: addrHelper(), // No IP addresses
+			Addrs: nil, // No IP addresses
 		},
 	}
 

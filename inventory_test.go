@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/andrew-d/proxmox-service-discovery/internal/pveapi"
+	"github.com/neilotoole/slogt"
 )
 
 // mockProxmoxClient is a test implementation of the proxmoxClient interface
@@ -87,28 +88,21 @@ func (a *noopAuthProvider) WriteCacheKey(w io.Writer) {
 	fmt.Fprintf(w, "noop\n")
 }
 
-// mkNet0 is a helper function to return a map[string]string with a key of
-// "net0" and a value of the provided string; useful for the NetworkInterfaces
-// field of QEMUConfig.
-func mkNet0(s string) map[string]string {
-	return map[string]string{"net0": s}
-}
-
 // TestFetchQEMUAddrs tests the fetchQEMUAddrs function
 func TestFetchQEMUAddrs(t *testing.T) {
 	tests := []struct {
 		name        string
 		qemuConfig  pveapi.QEMUConfig
 		interfaces  pveapi.AgentInterfacesResponse
-		expectedIPs []netip.Addr
+		expectedIPs []pveInventoryAddr
 	}{
 		{
 			name: "static_ip_in_ipconfig0", // for cloud-init
 			qemuConfig: pveapi.QEMUConfig{
-				IPConfig0:         "ip=192.168.1.100/24,gw=192.168.1.1",
+				IPConfig:          map[int]string{0: "ip=192.168.1.100/24,gw=192.168.1.1"},
 				NetworkInterfaces: mkNet0("virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0"),
 			},
-			expectedIPs: []netip.Addr{netip.MustParseAddr("192.168.1.100")},
+			expectedIPs: []pveInventoryAddr{mkPVEInventoryAddr("vmbr0", "192.168.1.100")},
 		},
 		{
 			name: "IP_from_agent_interfaces_with_MAC_match",
@@ -120,35 +114,54 @@ func TestFetchQEMUAddrs(t *testing.T) {
 					{
 						Name:            "eth0",
 						HardwareAddress: "AA:BB:CC:DD:EE:FF",
-						IPAddresses: []pveapi.AgentInterfaceAddress{
-							{
-								Type:    "ipv4",
-								Address: "192.168.1.101",
-								Prefix:  24,
-							},
-							{
-								Type:    "ipv6",
-								Address: "2001:db8::1",
-								Prefix:  64,
-							},
-						},
+						IPAddresses: mkAgentInterfaceAddrs(
+							"192.168.1.101/24",
+							"2001:db8::1/64",
+						),
 					},
 					{
 						Name:            "eth1",
 						HardwareAddress: "FF:EE:DD:CC:BB:AA",
-						IPAddresses: []pveapi.AgentInterfaceAddress{
-							{
-								Type:    "ipv4",
-								Address: "10.0.0.1",
-								Prefix:  24,
-							},
-						},
+						IPAddresses:     mkAgentInterfaceAddrs("10.0.0.1/24"),
 					},
 				},
 			},
-			expectedIPs: []netip.Addr{
-				netip.MustParseAddr("192.168.1.101"),
-				netip.MustParseAddr("2001:db8::1"),
+			expectedIPs: []pveInventoryAddr{
+				mkPVEInventoryAddr("vmbr0", "192.168.1.101", "2001:db8::1"),
+			},
+		},
+		{
+			name: "IP_from_agent_interfaces_multiple_bridges",
+			qemuConfig: pveapi.QEMUConfig{
+				NetworkInterfaces: map[int]string{
+					0: "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0",
+					1: "virtio=FF:EE:DD:CC:BB:AA,bridge=vmbr1",
+				},
+			},
+			interfaces: pveapi.AgentInterfacesResponse{
+				Result: []pveapi.AgentInterface{
+					{
+						Name:            "eth0",
+						HardwareAddress: "AA:BB:CC:DD:EE:FF",
+						IPAddresses:     mkAgentInterfaceAddrs("192.168.1.101/24"),
+					},
+					{
+						Name:            "eth1",
+						HardwareAddress: "FF:EE:DD:CC:BB:AA",
+						IPAddresses:     mkAgentInterfaceAddrs("10.0.0.1/24"),
+					},
+
+					// Not on a host-configured bridge
+					{
+						Name:            "eth2",
+						HardwareAddress: "00:01:02:03:04:05",
+						IPAddresses:     mkAgentInterfaceAddrs("172.16.0.10/12"),
+					},
+				},
+			},
+			expectedIPs: []pveInventoryAddr{
+				mkPVEInventoryAddr("vmbr0", "192.168.1.101"),
+				mkPVEInventoryAddr("vmbr1", "10.0.0.1"),
 			},
 		},
 		{
@@ -161,46 +174,34 @@ func TestFetchQEMUAddrs(t *testing.T) {
 					{
 						Name:            "eth0",
 						HardwareAddress: "AA:BB:CC:DD:EE:FF",
-						IPAddresses: []pveapi.AgentInterfaceAddress{
-							{
-								Type:    "ipv4",
-								Address: "192.168.1.101",
-								Prefix:  24,
-							},
-						},
+						IPAddresses:     mkAgentInterfaceAddrs("192.168.1.101/24"),
 					},
 					{
 						Name:            "eth1",
 						HardwareAddress: "FF:EE:DD:CC:BB:AA",
-						IPAddresses: []pveapi.AgentInterfaceAddress{
-							{
-								Type:    "ipv4",
-								Address: "10.0.0.1",
-								Prefix:  24,
-							},
-						},
+						IPAddresses:     mkAgentInterfaceAddrs("10.0.0.1/24"),
 					},
 					{
-						Name: "lo",
-						IPAddresses: []pveapi.AgentInterfaceAddress{
-							{
-								Type:    "ipv4",
-								Address: "127.0.0.1",
-								Prefix:  8,
-							},
-						},
+						Name:        "lo",
+						IPAddresses: mkAgentInterfaceAddrs("127.0.0.1/8"),
 					},
 				},
 			},
-			expectedIPs: []netip.Addr{
-				netip.MustParseAddr("192.168.1.101"),
-				netip.MustParseAddr("10.0.0.1"),
+			expectedIPs: []pveInventoryAddr{
+				mkPVEInventoryAddr("" /* unknown */, "192.168.1.101"),
+				mkPVEInventoryAddr("" /* unknown */, "10.0.0.1"),
 			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			oldLogger := logger
+			logger = slogt.New(t)
+			t.Cleanup(func() {
+				logger = oldLogger
+			})
+
 			mockClient := newMockProxmoxClient()
 			mockClient.qemuConfigs["node1/100"] = tt.qemuConfig
 			mockClient.qemuInterfaces["node1/100"] = tt.interfaces
@@ -219,7 +220,9 @@ func TestFetchQEMUAddrs(t *testing.T) {
 			}
 
 			// Sort expected; response from fetchQEMUAddrs should already be sorted.
-			slices.SortFunc(tt.expectedIPs, netip.Addr.Compare)
+			for _, expected := range tt.expectedIPs {
+				slices.SortFunc(expected.Addrs, netip.Addr.Compare)
+			}
 
 			// Check the result
 			if !reflect.DeepEqual(ips, tt.expectedIPs) {
@@ -235,7 +238,7 @@ func TestFetchLXCAddrs(t *testing.T) {
 		name        string
 		lxcConfig   pveapi.LXCConfig
 		interfaces  []pveapi.LXCInterface
-		expectedIPs []netip.Addr
+		expectedIPs []pveInventoryAddr
 	}{
 		{
 			name: "static_IP_in_config",
@@ -247,12 +250,29 @@ func TestFetchLXCAddrs(t *testing.T) {
 				HardwareAddress: "AA:BB:CC:DD:EE:FF",
 				Inet:            "192.168.1.100/24", // need to be here too
 			}},
-			expectedIPs: []netip.Addr{netip.MustParseAddr("192.168.1.100")},
+			expectedIPs: []pveInventoryAddr{mkPVEInventoryAddr("vmbr0", "192.168.1.100")},
+		},
+		{
+			name: "multiple_interface_addrs",
+			lxcConfig: pveapi.LXCConfig{
+				// This is a statically-configured IPv6 address...
+				NetworkInterfaces: mkNet0("name=eth0,bridge=vmbr0,hwaddr=AA:BB:CC:DD:EE:FF,ip6=2001:db8::1/64"),
+			},
+			interfaces: []pveapi.LXCInterface{{
+				Name:            "eth0",
+				HardwareAddress: "AA:BB:CC:DD:EE:FF",
+				// ... however the interfaces API endpoint returns a different one
+				Inet6: "fe80::1/64",
+			}},
+			expectedIPs: []pveInventoryAddr{
+				// We expect both addresses to be returned.
+				mkPVEInventoryAddr("vmbr0", "2001:db8::1", "fe80::1"),
+			},
 		},
 		{
 			name: "DHCP_in_config_IP_from_interfaces_with_MAC_match",
 			lxcConfig: pveapi.LXCConfig{
-				NetworkInterfaces: mkNet0("name=eth0,ip=dhcp,hwaddr=AA:BB:CC:DD:EE:FF"),
+				NetworkInterfaces: mkNet0("name=eth0,bridge=vmbr0,ip=dhcp,hwaddr=AA:BB:CC:DD:EE:FF"),
 			},
 			interfaces: []pveapi.LXCInterface{
 				{
@@ -267,15 +287,14 @@ func TestFetchLXCAddrs(t *testing.T) {
 					Inet:            "10.0.0.1/24",
 				},
 			},
-			expectedIPs: []netip.Addr{
-				netip.MustParseAddr("192.168.1.101"),
-				netip.MustParseAddr("2001:db8::1"),
+			expectedIPs: []pveInventoryAddr{
+				mkPVEInventoryAddr("vmbr0", "192.168.1.101", "2001:db8::1"),
 			},
 		},
 		{
 			name: "IP_from_interfaces_without_MAC_match",
 			lxcConfig: pveapi.LXCConfig{
-				NetworkInterfaces: mkNet0("name=eth0"), // No MAC address
+				NetworkInterfaces: mkNet0("name=eth0,bridge=vmbr0"), // No MAC address
 			},
 			interfaces: []pveapi.LXCInterface{
 				{
@@ -293,15 +312,21 @@ func TestFetchLXCAddrs(t *testing.T) {
 					Inet: "127.0.0.1/8",
 				},
 			},
-			expectedIPs: []netip.Addr{
-				netip.MustParseAddr("192.168.1.101"),
-				netip.MustParseAddr("10.0.0.1"),
+			expectedIPs: []pveInventoryAddr{
+				mkPVEInventoryAddr( /* unknown */ "", "192.168.1.101"),
+				mkPVEInventoryAddr( /* unknown */ "", "10.0.0.1"),
 			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			oldLogger := logger
+			logger = slogt.New(t)
+			t.Cleanup(func() {
+				logger = oldLogger
+			})
+
 			mockClient := newMockProxmoxClient()
 			mockClient.lxcConfigs["node1/100"] = tt.lxcConfig
 			mockClient.lxcInterfaces["node1/100"] = tt.interfaces
@@ -320,7 +345,9 @@ func TestFetchLXCAddrs(t *testing.T) {
 			}
 
 			// Sort expected; response from fetchLXCAddrs should already be sorted.
-			slices.SortFunc(tt.expectedIPs, netip.Addr.Compare)
+			for _, expected := range tt.expectedIPs {
+				slices.SortFunc(expected.Addrs, netip.Addr.Compare)
+			}
 
 			// Check the result
 			if !reflect.DeepEqual(ips, tt.expectedIPs) {
@@ -332,6 +359,12 @@ func TestFetchLXCAddrs(t *testing.T) {
 
 // TestFetchInventory tests the fetchInventory function
 func TestFetchInventory(t *testing.T) {
+	oldLogger := logger
+	logger = slogt.New(t)
+	t.Cleanup(func() {
+		logger = oldLogger
+	})
+
 	// Setup a mock client with test data
 	mockClient := newMockProxmoxClient()
 
@@ -361,9 +394,11 @@ func TestFetchInventory(t *testing.T) {
 
 	// Add QEMU configs and interfaces
 	mockClient.qemuConfigs["node1/100"] = pveapi.QEMUConfig{
-		IPConfig0:         "ip=192.168.1.100/24,gw=192.168.1.1",
+		IPConfig:          map[int]string{0: "ip=192.168.1.100/24,gw=192.168.1.1"},
 		NetworkInterfaces: mkNet0("virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0"),
 	}
+	// No qemuInterfaces for this node; should fall back to using ipconfig0
+
 	mockClient.qemuConfigs["node2/102"] = pveapi.QEMUConfig{
 		NetworkInterfaces: mkNet0("virtio=FF:EE:DD:CC:BB:AA,bridge=vmbr0"),
 	}
@@ -385,7 +420,7 @@ func TestFetchInventory(t *testing.T) {
 
 	// Add LXC configs and interfaces
 	mockClient.lxcConfigs["node1/200"] = pveapi.LXCConfig{
-		NetworkInterfaces: mkNet0("name=eth0,ip=192.168.1.200/24,gw=192.168.1.1,hwaddr=AA:BB:CC:DD:EE:FF"),
+		NetworkInterfaces: mkNet0("name=eth0,bridge=vmbr0,ip=192.168.1.200/24,gw=192.168.1.1,hwaddr=AA:BB:CC:DD:EE:FF"),
 	}
 	mockClient.lxcInterfaces["node1/200"] = []pveapi.LXCInterface{
 		{
@@ -395,7 +430,7 @@ func TestFetchInventory(t *testing.T) {
 		},
 	}
 	mockClient.lxcConfigs["node2/201"] = pveapi.LXCConfig{
-		NetworkInterfaces: mkNet0("name=eth0,ip=dhcp,hwaddr=BB:CC:DD:EE:FF:AA"),
+		NetworkInterfaces: mkNet0("name=eth0,bridge=vmbr0,ip=dhcp,hwaddr=BB:CC:DD:EE:FF:AA"),
 	}
 	mockClient.lxcInterfaces["node2/201"] = []pveapi.LXCInterface{
 		{
@@ -422,36 +457,44 @@ func TestFetchInventory(t *testing.T) {
 	// Check the results
 	expectedResources := []pveInventoryItem{
 		{
-			Name:  "vm1",
-			ID:    100,
-			Node:  "node1",
-			Type:  pveItemTypeQEMU,
-			Tags:  stringBoolMap("web", "prod"),
-			Addrs: addrHelper(netip.MustParseAddr("192.168.1.100")),
+			Name: "vm1",
+			ID:   100,
+			Node: "node1",
+			Type: pveItemTypeQEMU,
+			Tags: stringBoolMap("web", "prod"),
+			Addrs: []pveInventoryAddr{
+				mkPVEInventoryAddr("vmbr0", "192.168.1.100"),
+			},
 		},
 		{
-			Name:  "vm3",
-			ID:    102,
-			Node:  "node2",
-			Type:  pveItemTypeQEMU,
-			Tags:  stringBoolMap("app", "prod"),
-			Addrs: addrHelper(netip.MustParseAddr("192.168.1.102")),
+			Name: "vm3",
+			ID:   102,
+			Node: "node2",
+			Type: pveItemTypeQEMU,
+			Tags: stringBoolMap("app", "prod"),
+			Addrs: []pveInventoryAddr{
+				mkPVEInventoryAddr("vmbr0", "192.168.1.102"),
+			},
 		},
 		{
-			Name:  "lxc1",
-			ID:    200,
-			Node:  "node1",
-			Type:  pveItemTypeLXC,
-			Tags:  stringBoolMap("cache", "prod"),
-			Addrs: addrHelper(netip.MustParseAddr("192.168.1.200")),
+			Name: "lxc1",
+			ID:   200,
+			Node: "node1",
+			Type: pveItemTypeLXC,
+			Tags: stringBoolMap("cache", "prod"),
+			Addrs: []pveInventoryAddr{
+				mkPVEInventoryAddr("vmbr0", "192.168.1.200"),
+			},
 		},
 		{
-			Name:  "lxc2",
-			ID:    201,
-			Node:  "node2",
-			Type:  pveItemTypeLXC,
-			Tags:  stringBoolMap("web", "stage"),
-			Addrs: addrHelper(netip.MustParseAddr("192.168.1.201")),
+			Name: "lxc2",
+			ID:   201,
+			Node: "node2",
+			Type: pveItemTypeLXC,
+			Tags: stringBoolMap("web", "stage"),
+			Addrs: []pveInventoryAddr{
+				mkPVEInventoryAddr("vmbr0", "192.168.1.201"),
+			},
 		},
 	}
 
@@ -474,19 +517,19 @@ func TestFetchInventory(t *testing.T) {
 			t.Errorf("resource %d: got name %s, want %s", i, res.Name, expectedResources[i].Name)
 		}
 		if res.ID != expectedResources[i].ID {
-			t.Errorf("resource %d: got ID %d, want %d", i, res.ID, expectedResources[i].ID)
+			t.Errorf("resource %q: got ID %d, want %d", res.Name, res.ID, expectedResources[i].ID)
 		}
 		if res.Node != expectedResources[i].Node {
-			t.Errorf("resource %d: got node %s, want %s", i, res.Node, expectedResources[i].Node)
+			t.Errorf("resource %q: got node %s, want %s", res.Name, res.Node, expectedResources[i].Node)
 		}
 		if res.Type != expectedResources[i].Type {
-			t.Errorf("resource %d: got type %v, want %v", i, res.Type, expectedResources[i].Type)
+			t.Errorf("resource %q: got type %v, want %v", res.Name, res.Type, expectedResources[i].Type)
 		}
 		if !reflect.DeepEqual(res.Tags, expectedResources[i].Tags) {
-			t.Errorf("resource %d: got tags %v, want %v", i, res.Tags, expectedResources[i].Tags)
+			t.Errorf("resource %q: got tags %v, want %v", res.Name, res.Tags, expectedResources[i].Tags)
 		}
 		if !reflect.DeepEqual(res.Addrs, expectedResources[i].Addrs) {
-			t.Errorf("resource %d: got addresses %v, want %v", i, res.Addrs, expectedResources[i].Addrs)
+			t.Errorf("resource %q: got addresses %v, want %v", res.Name, res.Addrs, expectedResources[i].Addrs)
 		}
 	}
 }

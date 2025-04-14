@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -95,6 +96,30 @@ func collectWithPrefix(mm map[string]any, prefix string) map[string]string {
 	return ret
 }
 
+// collectWithPrefixNum will iterate through every entry in mm, adding the values
+// of any keys with the given prefix to the returned map, keyed by the
+// numerical suffix, so long as their value is also string.
+func collectWithPrefixNum(mm map[string]any, prefix string) map[int]string {
+	var ret map[int]string
+	for k, v := range mm {
+		sv, ok := v.(string)
+		if !ok {
+			continue
+		}
+		suff, ok := strings.CutPrefix(k, prefix)
+		if !ok {
+			continue
+		}
+		if num, err := strconv.Atoi(suff); err == nil && num >= 0 {
+			if ret == nil {
+				ret = make(map[int]string)
+			}
+			ret[num] = sv
+		}
+	}
+	return ret
+}
+
 func (c *HTTPClient) GetQEMUConfig(ctx context.Context, node string, vmID int) (QEMUConfig, error) {
 	uri := fmt.Sprintf("%s/api2/json/nodes/%s/qemu/%d/config", c.host, node, vmID)
 	kvs, err := fetchFromProxmox[map[string]any](c, ctx, uri)
@@ -102,14 +127,13 @@ func (c *HTTPClient) GetQEMUConfig(ctx context.Context, node string, vmID int) (
 		return QEMUConfig{}, err
 	}
 
-	// Copy the IPConfig0 value to the struct
 	var config QEMUConfig
-	if ipConfig, ok := kvs["ipconfig0"].(string); ok {
-		config.IPConfig0 = ipConfig
-	}
+
+	// Copy any entries that start with "ipconfig" to the IPConfig map.
+	config.IPConfig = collectWithPrefixNum(kvs, "ipconfig")
 
 	// Copy any entries that start with "net" to the NetworkInterfaces map.
-	config.NetworkInterfaces = collectWithPrefix(kvs, "net")
+	config.NetworkInterfaces = collectWithPrefixNum(kvs, "net")
 
 	return config, nil
 }
@@ -123,7 +147,7 @@ func (c *HTTPClient) GetLXCConfig(ctx context.Context, node string, vmID int) (L
 
 	// Copy any entries that start with "net" to the NetworkInterfaces map.
 	var config LXCConfig
-	config.NetworkInterfaces = collectWithPrefix(kvs, "net")
+	config.NetworkInterfaces = collectWithPrefixNum(kvs, "net")
 	return config, nil
 }
 
