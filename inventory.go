@@ -653,16 +653,17 @@ func (s *server) fetchLXCAddrs(ctx context.Context, node string, vmID int) ([]pv
 	}
 	logger.Debug("fetched LXC guest interfaces", "num_interfaces", len(interfaces))
 
-	lxcConfig := lxcInformation{
-		ID:         vmID,
-		Node:       node,
-		Config:     conf,
-		Interfaces: interfaces,
-	}
-	return extractLXCAddrs(ctx, logger, &lxcConfig)
+	return extractLXCAddrs(ctx, logger, conf, interfaces)
 }
 
-func extractLXCAddrs(ctx context.Context, logger *slog.Logger, conf *lxcInformation) ([]pveInventoryAddr, error) {
+func extractLXCAddrs(
+	ctx context.Context,
+	logger *slog.Logger,
+	config pveapi.LXCConfig,
+	interfaces []pveapi.LXCInterface,
+) ([]pveInventoryAddr, error) {
+	ifmap := kvMap{inner: config.NetworkInterfaces}
+
 	// Parse the provided interface configuration, building up data
 	// structures that we use below.
 	var (
@@ -680,8 +681,8 @@ func extractLXCAddrs(ctx context.Context, logger *slog.Logger, conf *lxcInformat
 		// statically-configured addresses as well, just to be sure.
 		staticAddrs = make(map[string][]netip.Addr) // map["TKTK"]ips
 	)
-	for ifnum := range conf.Config.NetworkInterfaces {
-		kvs := conf.getNetworkKV(ifnum)
+	for ifnum := range config.NetworkInterfaces {
+		kvs := ifmap.Get(ifnum)
 
 		// We always expect a bridge name and hardware address in the
 		// LXC configuration.
@@ -732,7 +733,7 @@ func extractLXCAddrs(ctx context.Context, logger *slog.Logger, conf *lxcInformat
 
 	// Now parse the interface information.
 	var addrsFromLXC []addrInfo
-	for _, iface := range conf.Interfaces {
+	for _, iface := range interfaces {
 		if iface.Name == "lo" {
 			continue
 		}
@@ -790,7 +791,7 @@ func extractLXCAddrs(ctx context.Context, logger *slog.Logger, conf *lxcInformat
 	} else {
 		// Log all interface configuration for debugging.
 		var attrs []any
-		for ifnum, confstr := range conf.Config.NetworkInterfaces {
+		for ifnum, confstr := range config.NetworkInterfaces {
 			attrs = append(attrs, slog.String(
 				fmt.Sprintf("iface_net%d", ifnum),
 				confstr,
