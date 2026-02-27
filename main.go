@@ -343,14 +343,23 @@ func (s *server) updateDNSRecords(ctx context.Context) error {
 		records = make(map[string]record)
 	)
 	for _, item := range filtered {
-		fqdn := item.Name + "." + s.dnsZone
-
 		if len(item.Addrs) == 0 {
+			fqdn := item.Name + "." + s.dnsZone
 			logger.Warn("no addresses for resource", "fqdn", fqdn)
 			noAddrs = append(noAddrs, fqdn)
 			continue
 		}
 
+		// Build list of FQDNs: hostname + aliases from traefik labels
+		fqdns := []string{item.Name + "." + s.dnsZone}
+		for _, alias := range item.Aliases {
+			aliasFQDN := alias + "." + s.dnsZone
+			if aliasFQDN != fqdns[0] { // skip if same as hostname
+				fqdns = append(fqdns, aliasFQDN)
+			}
+		}
+
+		for _, fqdn := range fqdns {
 		var answers []dns.RR
 		for _, addr := range item.Addrs {
 			if addr.Is4() {
@@ -380,6 +389,7 @@ func (s *server) updateDNSRecords(ctx context.Context) error {
 			FQDN:    fqdn,
 			Answers: answers,
 		}
+		} // end for fqdn
 	}
 
 	// Update the DNS records

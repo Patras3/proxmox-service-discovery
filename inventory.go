@@ -106,6 +106,8 @@ type pveInventoryItem struct {
 	Tags map[string]bool
 	// Addrs are the IP addresses associated with the resource.
 	Addrs []netip.Addr
+	// Aliases are additional DNS names from traefik labels.
+	Aliases []string
 }
 
 type pveItemType int
@@ -364,13 +366,26 @@ func (s *server) fetchInventoryFromNode(ctx context.Context, node string) (inven
 		}
 		logger.Debug("fetched IP addresses for VM", "vm", vm.Name, "addrs", addrs)
 
+		// Parse traefik labels from config description
+		vmConfig, err := s.client.GetQEMUConfig(ctx, node, vm.VMID)
+		var aliases []string
+		if err == nil {
+			overrides := parseTraefikLabels(vmConfig.Description, s.dnsZone)
+			aliases = overrides.Aliases
+			if overrides.OverrideAddr != nil {
+				addrs = []netip.Addr{*overrides.OverrideAddr}
+				logger.Debug("using override addr from traefik label", "vm", vm.Name, "addr", overrides.OverrideAddr)
+			}
+		}
+
 		inventory.Resources = append(inventory.Resources, pveInventoryItem{
-			Name:  vm.Name,
-			ID:    vm.VMID,
-			Node:  node,
-			Type:  pveItemTypeQEMU,
-			Tags:  stringBoolMap(strings.Split(vm.Tags, ";")...),
-			Addrs: addrs,
+			Name:    vm.Name,
+			ID:      vm.VMID,
+			Node:    node,
+			Type:    pveItemTypeQEMU,
+			Tags:    stringBoolMap(strings.Split(vm.Tags, ";")...),
+			Addrs:   addrs,
+			Aliases: aliases,
 		})
 	}
 
@@ -388,20 +403,33 @@ func (s *server) fetchInventoryFromNode(ctx context.Context, node string) (inven
 			continue
 		}
 
-		// Get the IP address of the VM
+		// Get the IP address of the LXC
 		addrs, err := s.fetchLXCAddrs(ctx, node, lxc.VMID)
 		if err != nil {
 			return inventory, stats, fmt.Errorf("fetching IP addresses for LXC %q on %q: %w", lxc.VMID, node, err)
 		}
 		logger.Debug("fetched IP addresses for LXC", "lxc", lxc.Name, "addrs", addrs)
 
+		// Parse traefik labels from config description
+		lxcConfig, err := s.client.GetLXCConfig(ctx, node, lxc.VMID)
+		var aliases []string
+		if err == nil {
+			overrides := parseTraefikLabels(lxcConfig.Description, s.dnsZone)
+			aliases = overrides.Aliases
+			if overrides.OverrideAddr != nil {
+				addrs = []netip.Addr{*overrides.OverrideAddr}
+				logger.Debug("using override addr from traefik label", "lxc", lxc.Name, "addr", overrides.OverrideAddr)
+			}
+		}
+
 		inventory.Resources = append(inventory.Resources, pveInventoryItem{
-			Name:  lxc.Name,
-			ID:    lxc.VMID,
-			Node:  node,
-			Type:  pveItemTypeLXC,
-			Tags:  stringBoolMap(strings.Split(lxc.Tags, ";")...),
-			Addrs: addrs,
+			Name:    lxc.Name,
+			ID:      lxc.VMID,
+			Node:    node,
+			Type:    pveItemTypeLXC,
+			Tags:    stringBoolMap(strings.Split(lxc.Tags, ";")...),
+			Addrs:   addrs,
+			Aliases: aliases,
 		})
 	}
 	return inventory, stats, nil
