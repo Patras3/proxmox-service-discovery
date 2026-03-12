@@ -3,10 +3,13 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/netip"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -48,6 +51,9 @@ var (
 
 	// Debug HTTP server configuration
 	debugAddr = pflag.String("debug-addr", "", "address to listen on for HTTP debug server (disabled if empty)")
+
+	// Extra static records file
+	extraRecordsFile = pflag.String("extra-records", "", "path to YAML/JSON file with extra DNS records (name→IP mappings)")
 
 	// One of these must be set
 	proxmoxPassword    = pflag.StringP("proxmox-password", "p", "", "Proxmox password to connect with")
@@ -152,12 +158,13 @@ func main() {
 	}))
 
 	server, err := newServer(Options{
-		Host:       *proxmoxHost,
-		DNSZone:    *dnsZone,
-		Auth:       auth,
-		DebugAddr:  *debugAddr,
-		CachePath:  *cachePath,
-		HTTPClient: httpc,
+		Host:             *proxmoxHost,
+		DNSZone:          *dnsZone,
+		Auth:             auth,
+		DebugAddr:        *debugAddr,
+		CachePath:        *cachePath,
+		HTTPClient:       httpc,
+		ExtraRecordsFile: *extraRecordsFile,
 	})
 	if err != nil {
 		pvelog.Fatal(logger, "error creating server", pvelog.Error(err))
@@ -245,6 +252,9 @@ type server struct {
 	cachedInventory *pveInventory
 	cachedErr       error
 
+	// Extra static records
+	extraRecordsFile string
+
 	// DNS state
 	mu                  sync.RWMutex
 	records             map[string]record
@@ -275,6 +285,11 @@ type Options struct {
 	//
 	// This field is optional. If empty, no cache will be used.
 	CachePath string
+	// ExtraRecordsFile is the path to a JSON file with extra static DNS
+	// records. Format: {"name": "ip", ...} e.g. {"wled-dom": "192.168.50.35"}
+	//
+	// This field is optional. If empty, no extra records are loaded.
+	ExtraRecordsFile string
 }
 
 // newServer creates a new server instance with the given configuration
@@ -298,16 +313,17 @@ func newServer(opts Options) (*server, error) {
 	}
 
 	s := &server{
-		host:      opts.Host,
-		dnsZone:   opts.DNSZone,
-		auth:      opts.Auth,
-		client:    pveapi.NewClient(httpc, opts.Host, opts.Auth),
-		httpc:     httpc,
-		fc:        fc,
-		filt:      filt,
-		dnsMux:    dns.NewServeMux(),
-		debugAddr: opts.DebugAddr,
-		cachePath: opts.CachePath,
+		host:             opts.Host,
+		dnsZone:          opts.DNSZone,
+		auth:             opts.Auth,
+		client:           pveapi.NewClient(httpc, opts.Host, opts.Auth),
+		httpc:            httpc,
+		fc:               fc,
+		filt:             filt,
+		dnsMux:           dns.NewServeMux(),
+		debugAddr:        opts.DebugAddr,
+		cachePath:        opts.CachePath,
+		extraRecordsFile: opts.ExtraRecordsFile,
 	}
 
 	// Initialize the DNS request handler
@@ -327,6 +343,43 @@ type record struct {
 	Answers []dns.RR // the DNS records to return
 }
 
+// loadExtraRecords reads the extra records file and returns inventory items.
+// File format: JSON object {"name": "ip", ...}
+func (s *server) loadExtraRecords() []pveInventoryItem {
+	if s.extraRecordsFile == "" {
+		return nil
+	}
+
+	data, err := os.ReadFile(s.extraRecordsFile)
+	if err != nil {
+		logger.Warn("failed to read extra records file", "path", s.extraRecordsFile, pvelog.Error(err))
+		return nil
+	}
+
+	var raw map[string]string
+	if err := json.Unmarshal(data, &raw); err != nil {
+		logger.Warn("failed to parse extra records file", "path", s.extraRecordsFile, pvelog.Error(err))
+		return nil
+	}
+
+	var items []pveInventoryItem
+	for name, ipStr := range raw {
+		addr, err := netip.ParseAddr(ipStr)
+		if err != nil {
+			logger.Warn("invalid IP in extra records", "name", name, "ip", ipStr, pvelog.Error(err))
+			continue
+		}
+		items = append(items, pveInventoryItem{
+			Name:  name,
+			Addrs: []netip.Addr{addr},
+		})
+		logger.Debug("loaded extra record", "name", name, "ip", ipStr)
+	}
+
+	logger.Info("loaded extra records", "count", len(items))
+	return items
+}
+
 func (s *server) updateDNSRecords(ctx context.Context) error {
 	// Fetch the current inventory
 	inventory, err := s.fetchInventory(ctx)
@@ -336,6 +389,9 @@ func (s *server) updateDNSRecords(ctx context.Context) error {
 
 	// Filter the inventory to only include resources we care about.
 	filtered := s.filt.FilterResources(inventory.Resources)
+
+	// Append extra static records (not subject to filtering).
+	filtered = append(filtered, s.loadExtraRecords()...)
 
 	// Create the DNS record map.
 	var (
